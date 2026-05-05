@@ -1,0 +1,868 @@
+
+def avg(lst):
+    return sum(lst) / len(lst) if lst else 0
+
+def kda(k, d, a):
+    return (k + a) / max(d, 1)
+
+def kd(k, d):
+    return k / max(d, 1)
+
+def kp(k, a, team_k):
+    return (k + a) / max(team_k, 1) * 100
+
+# ── Helper: rate-limit-safe GET ──────────────────────────────────────────────
+def safe_get(url, retries=5):
+    for attempt in range(retries):
+        r = requests.get(url)
+        if r.status_code == 200:
+            return r.json()
+        elif r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 5))
+            print(f"  Rate limited — waiting {wait}s")
+            time.sleep(wait + 1)
+        else:
+            print(f"  Bad status {r.status_code}: {r.text}")
+            return None
+    return None
+
+TIER_ORDER = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"]
+DIV_ORDER  = {"IV": 0, "III": 1, "II": 2, "I": 3}
+
+def rank_to_num(rank_str):
+    if rank_str == "Unranked":
+        return None
+    parts = rank_str.upper().split()
+    if len(parts) == 1:  # MASTER/GRANDMASTER/CHALLENGER have no division
+        tier = parts[0]
+        if tier in TIER_ORDER:
+            return TIER_ORDER.index(tier) * 4
+        return None
+    tier, div = parts[0], parts[1]
+    if tier not in TIER_ORDER or div not in DIV_ORDER:
+        return None
+    return TIER_ORDER.index(tier) * 4 + DIV_ORDER[div]
+
+def num_to_rank(n):
+    if n is None:
+        return "Unranked"
+    n = round(n)
+    tier_idx = n // 4
+    div_idx  = n % 4
+    tier_idx = max(0, min(tier_idx, len(TIER_ORDER) - 1))
+    tier = TIER_ORDER[tier_idx]
+    if tier in ("MASTER", "GRANDMASTER", "CHALLENGER"):
+        return tier.capitalize()
+    divs = ["IV", "III", "II", "I"]
+    return f"{tier.capitalize()} {divs[div_idx]}"
+
+
+match_ids = []
+
+for start in range(0, 50, 50):  # 0,100,200,300,400
+    ids_url = (
+        f"https://sea.api.riotgames.com/lol/match/v5/matches/by-puuid/"
+        f"{PUUID}/ids?type=ranked&start={start}&count=20&api_key={API_KEY}"
+    )
+    
+    batch = safe_get(ids_url)
+    
+    if not batch:
+        break  # no more games available
+    
+    match_ids.extend(batch)
+    
+    print(f"Fetched {len(match_ids)} match IDs so far...")
+    
+    time.sleep(1.2)  # avoid rate limit
+# ── Phase boundaries (minutes) ──────────────────────────────────────────────
+EARLY_END_MS  = 15 * 60 * 1000   # 0–15 min
+MID_END_MS    = 30 * 60 * 1000   # 15–30 min
+# Late = 30 min+
+
+# ── Global counters ──────────────────────────────────────────────────────────
+games_played = 0
+wins = 0
+losses = 0
+game_count = 0
+
+# K / D / A totals (all game)
+my_top_total_k = 0
+my_top_total_d = 0
+my_top_total_a = 0
+enemy_top_total_k = 0
+enemy_top_total_d = 0
+enemy_top_total_a = 0
+
+# Team K/D totals — TRUE ratio of totals, not average of ratios
+my_team_total_k_all = 0
+my_team_total_d_all = 0
+enemy_team_total_k_all = 0
+enemy_team_total_d_all = 0
+
+my_team_kd_higher_games = 0
+enemy_team_kd_higher_games = 0
+tied_team_kd_games = 0
+
+# team kd - top laners
+# Team K/D excluding top laners
+my_team_no_top_k = 0
+my_team_no_top_d = 0
+enemy_team_no_top_k = 0
+enemy_team_no_top_d = 0
+
+# Deaths
+my_deaths_list = []
+teammate_deaths_list = []
+enemy_deaths_list = []
+enemy_top_deaths_list = []
+
+# Damage
+my_dmg_list = []
+enemy_top_dmg_list = []
+my_dmg_share_list = []          # share of own team total
+enemy_top_dmg_share_list = []   # share of enemy team total
+
+# Mitigation
+my_mit_list = []
+enemy_top_mit_list = []
+my_mit_share_list = []
+enemy_top_mit_share_list = []
+
+# Turret / objective damage
+my_top_turret_dmg = []
+enemy_top_turret_dmg = []
+my_obj_dmg = []
+enemy_obj_dmg = []
+top_games = 0
+obj_games = 0
+
+# Objectives
+my_dragons = []
+enemy_dragons = []
+my_barons = []
+enemy_barons = []
+
+# Gold
+my_team_gold = []
+enemy_team_gold = []
+my_top_gold = []
+enemy_top_gold = []
+gold_diff_15 = []
+
+# Split gold by team advantage
+my_top_gold_enemy_better = []
+enemy_top_gold_enemy_better = []
+my_top_gold_my_team_better = []
+enemy_top_gold_my_team_better = []
+my_team_gold_enemy_better = []
+enemy_team_gold_enemy_better = []
+my_team_gold_my_team_better = []
+enemy_team_gold_my_team_better = []
+gold_diff_15_enemy_better = []
+gold_diff_15_my_team_better = []
+
+# Team-state split K/D counters
+my_k_enemy_better = 0
+my_d_enemy_better = 0
+my_a_enemy_better = 0
+enemy_top_k_enemy_better = 0
+enemy_top_d_enemy_better = 0
+enemy_top_a_enemy_better = 0
+
+my_k_when_winning = 0
+my_d_when_winning = 0
+my_a_when_winning = 0
+enemy_top_k_my_team_better = 0
+enemy_top_d_my_team_better = 0
+enemy_top_a_my_team_better = 0
+
+# Team-state split TRUE K/D totals
+my_team_k_enemy_better = 0
+my_team_d_enemy_better = 0
+enemy_team_k_enemy_better = 0
+enemy_team_d_enemy_better = 0
+
+my_team_k_my_team_better = 0
+my_team_d_my_team_better = 0
+enemy_team_k_my_team_better = 0
+enemy_team_d_my_team_better = 0
+
+enemy_better_games = 0
+my_team_better_games = 0
+
+# ── Phase K/D/A + KP% counters ───────────────────────────────────────────────
+# We track raw K/D/A in each phase for you and enemy top
+# KP% = (your phase kills + your phase assists) / team phase kills
+
+# You
+my_early_k = 0; my_early_d = 0; my_early_a = 0
+my_mid_k   = 0; my_mid_d   = 0; my_mid_a   = 0
+my_late_k  = 0; my_late_d  = 0; my_late_a  = 0
+
+# Enemy top
+et_early_k = 0; et_early_d = 0; et_early_a = 0
+et_mid_k   = 0; et_mid_d   = 0; et_mid_a   = 0
+et_late_k  = 0; et_late_d  = 0; et_late_a  = 0
+
+# Team kills per phase (for KP%)
+team_early_k = 0
+team_mid_k   = 0
+team_late_k  = 0
+
+# enemy team kills per phase
+enemy_team_early_k = 0
+enemy_team_mid_k   = 0
+enemy_team_late_k  = 0
+rank_cache = {}
+
+#ranks
+my_rank_nums = []
+enemy_top_rank_nums = []
+my_team_rank_nums = []
+enemy_team_rank_nums = []
+
+def get_rank(summoner_id):
+    url = f"https://sea.api.riotgames.com/lol/league/v4/entries/by-summoner/{summoner_id}?api_key={API_KEY}"
+    data = safe_get(url)
+    if not data:
+        return "Unranked"
+    for entry in data:
+        if entry["queueType"] == "RANKED_SOLO_5x5":
+            return f"{entry['tier']} {entry['rank']}"
+    return "Unranked"
+
+def get_rank_cached(summoner_id):
+    if summoner_id in rank_cache:
+        return rank_cache[summoner_id]
+    rank = get_rank(summoner_id)
+    rank_cache[summoner_id] = rank
+    return rank
+
+
+# ────────────────────────────────────────────────────────────────────────────
+for match_id in match_ids:
+    url = f"https://sea.api.riotgames.com/lol/match/v5/matches/{match_id}?api_key={API_KEY}"
+    data = safe_get(url)
+    if "info" not in data:
+        print(f"\n=== {match_id} === SKIPPED: {data}")
+        continue
+
+    participants = data["info"]["participants"]
+
+    # Confirm player is top this game
+    my_role = None
+    for p in participants:
+        if p["puuid"] == PUUID:
+            my_role = p["teamPosition"]
+            break
+    if my_role != "TOP":
+        continue
+
+    # ── Basic identifiers ────────────────────────────────────────────────────
+    my_team_id = None
+    for p in participants:
+        if p["puuid"] == PUUID:
+            my_team_id = p["teamId"]
+            break
+    enemy_team_id = 200 if my_team_id == 100 else 100
+
+    puuid_to_pid = {p["puuid"]: p["participantId"] for p in participants}
+    my_pid = puuid_to_pid[PUUID]
+
+    enemy_top_pid = None
+    enemy_top_puuid = None
+    for p in participants:
+        if p["teamPosition"] == "TOP" and p["teamId"] != my_team_id:
+            enemy_top_pid = p["participantId"]
+            enemy_top_puuid = p["puuid"]
+            break
+
+    # ── End-of-game stats ────────────────────────────────────────────────────
+    my_team_win = None
+    team_stats = {100: {"k": 0, "d": 0}, 200: {"k": 0, "d": 0}}
+
+    my_personal_k = None; my_personal_d = None; my_personal_a = None
+    enemy_top_k = None;   enemy_top_d = None;   enemy_top_a = None
+    enemy_top_deaths = None
+
+    my_dmg = None; enemy_top_dmg_val = None
+    my_mit = None; enemy_top_mit_val = None
+    my_turr = None; enemy_top_turr = None
+    my_obj = None; enemy_obj_val = None
+
+    my_team_total_gold = 0; enemy_team_total_gold = 0
+    my_top_gold_this_game = None; enemy_top_gold_this_game = None
+
+    my_team_dmg_total = 0; enemy_team_dmg_total = 0
+    my_team_mit_total = 0; enemy_team_mit_total = 0
+
+    my_deaths = 0; teammate_deaths = 0; enemy_deaths_count = 0
+
+    print(f"\n=== {match_id} ===")
+    print(f"{'Name':<20} {'Champ':<15} {'K/D/A':<12} {'DMG':<8} {'TurrDMG':<9} {'ObjDMG':<8} {'SelfMit':<9} {'Win'}")
+    print("-" * 100)
+
+    my_summoner_id = None
+    enemy_top_summoner_id = None
+    my_team_summoner_ids = []
+    enemy_team_summoner_ids = []
+
+    #get current ranks 
+    for p in participants:
+        if p["teamPosition"] != "TOP":
+            if p["teamId"] == my_team_id:
+                my_team_summoner_ids.append(p["summonerId"])
+            else:
+                enemy_team_summoner_ids.append(p["summonerId"])
+        if p["puuid"] == PUUID:
+            my_summoner_id = p["summonerId"]
+        if p["teamPosition"] == "TOP" and p["teamId"] != my_team_id:
+            enemy_top_summoner_id = p["summonerId"]
+    print(f"  my_summoner_id: {my_summoner_id}")
+    print(f"  enemy_top_summoner_id: {enemy_top_summoner_id}")
+    print(f"  URL test: https://sea.api.riotgames.com/lol/league/v4/entries/by-summoner/{my_summoner_id}?api_key={API_KEY}")
+
+    my_rank = get_rank_cached(my_summoner_id)
+    enemy_top_rank = get_rank_cached(enemy_top_summoner_id)
+    my_team_ranks = [get_rank_cached(sid) for sid in my_team_summoner_ids]
+    enemy_team_ranks = [get_rank_cached(sid) for sid in enemy_team_summoner_ids]
+
+    n = rank_to_num(my_rank)
+    if n is not None: my_rank_nums.append(n)
+
+    n = rank_to_num(enemy_top_rank)
+    if n is not None: enemy_top_rank_nums.append(n)
+
+    for r in my_team_ranks:
+        n = rank_to_num(r)
+        if n is not None: my_team_rank_nums.append(n)
+
+    for r in enemy_team_ranks:
+        n = rank_to_num(r)
+        if n is not None: enemy_team_rank_nums.append(n)
+
+
+
+
+    for p in participants:
+        name = p["riotIdGameName"]
+        champ = p["championName"]
+        k, d, a = p["kills"], p["deaths"], p["assists"]
+        dmg  = p["totalDamageDealtToChampions"]
+        turr = p["damageDealtToTurrets"]
+        obj  = p["damageDealtToObjectives"]
+        mit  = p["damageSelfMitigated"]
+        win  = "W" if p["win"] else "L"
+        me   = " <--" if p["puuid"] == PUUID else ""
+
+        team_stats[p["teamId"]]["k"] += k
+        team_stats[p["teamId"]]["d"] += d
+
+
+
+        if p["teamPosition"] != "TOP":
+            if p["teamId"] == my_team_id:
+                my_team_no_top_k += p["kills"]
+                my_team_no_top_d += p["deaths"]
+            else:
+                enemy_team_no_top_k += p["kills"]
+                enemy_team_no_top_d += p["deaths"]
+        # Team damage/mit totals
+        if p["teamId"] == my_team_id:
+            my_team_dmg_total += dmg
+            my_team_mit_total += mit
+            my_team_total_gold += p["goldEarned"]
+        else:
+            enemy_team_dmg_total += dmg
+            enemy_team_mit_total += mit
+            enemy_team_total_gold += p["goldEarned"]
+
+        # Deaths breakdown
+        if p["teamId"] == my_team_id:
+            if p["puuid"] == PUUID:
+                my_deaths = d
+            teammate_deaths += d
+        else:
+            enemy_deaths_count += d
+
+        # Win
+        if p["puuid"] == PUUID:
+            my_team_win = p["win"]
+
+        # Me
+        if p["puuid"] == PUUID:
+            my_personal_k = k; my_personal_d = d; my_personal_a = a
+            my_dmg = dmg; my_mit = mit
+
+        # Enemy top
+        if p["teamPosition"] == "TOP" and p["teamId"] != my_team_id:
+            enemy_top_k = k; enemy_top_d = d; enemy_top_a = a
+            enemy_top_deaths = d
+            enemy_top_dmg_val = dmg; enemy_top_mit_val = mit
+
+        # Turret / obj per top laner
+        if p["teamPosition"] == "TOP":
+            if p["puuid"] == PUUID:
+                my_turr = turr; my_obj = obj
+            elif p["teamId"] != my_team_id:
+                enemy_top_turr = turr; enemy_obj_val = obj
+
+        # Gold
+        if p["teamPosition"] == "TOP":
+            if p["puuid"] == PUUID:
+                my_top_gold_this_game = p["goldEarned"]
+            elif p["teamId"] != my_team_id:
+                enemy_top_gold_this_game = p["goldEarned"]
+
+        print(f"{name:<20} {champ:<15} {k}/{d}/{a:<9} {dmg:<8} {turr:<9} {obj:<8} {mit:<9} {win}{me}")
+    games_played += 1
+    print(f"game number: {games_played}")
+    if my_team_win is True:
+        wins += 1
+    elif my_team_win is False:
+        losses += 1
+
+    # ── Damage / mit share ───────────────────────────────────────────────────
+    if my_dmg is not None and my_team_dmg_total > 0:
+        my_dmg_list.append(my_dmg)
+        my_dmg_share_list.append(my_dmg / my_team_dmg_total * 100)
+    if enemy_top_dmg_val is not None and enemy_team_dmg_total > 0:
+        enemy_top_dmg_list.append(enemy_top_dmg_val)
+        enemy_top_dmg_share_list.append(enemy_top_dmg_val / enemy_team_dmg_total * 100)
+
+    if my_mit is not None and my_team_mit_total > 0:
+        my_mit_list.append(my_mit)
+        my_mit_share_list.append(my_mit / my_team_mit_total * 100)
+    if enemy_top_mit_val is not None and enemy_team_mit_total > 0:
+        enemy_top_mit_list.append(enemy_top_mit_val)
+        enemy_top_mit_share_list.append(enemy_top_mit_val / enemy_team_mit_total * 100)
+
+    # ── Accumulate K/D/A totals ──────────────────────────────────────────────
+    if my_personal_k is not None:
+        my_top_total_k += my_personal_k
+        my_top_total_d += my_personal_d
+        my_top_total_a += my_personal_a
+    if enemy_top_k is not None:
+        enemy_top_total_k += enemy_top_k
+        enemy_top_total_d += enemy_top_d
+        enemy_top_total_a += enemy_top_a
+
+    # ── Deaths ───────────────────────────────────────────────────────────────
+    my_deaths_list.append(my_deaths)
+    teammate_deaths_list.append(teammate_deaths)
+    enemy_deaths_list.append(enemy_deaths_count)
+    if enemy_top_deaths is not None:
+        enemy_top_deaths_list.append(enemy_top_deaths)
+
+    # ── Turret / obj ─────────────────────────────────────────────────────────
+    if my_turr is not None and enemy_top_turr is not None:
+        my_top_turret_dmg.append(my_turr)
+        enemy_top_turret_dmg.append(enemy_top_turr)
+        top_games += 1
+    if my_obj is not None and enemy_obj_val is not None:
+        my_obj_dmg.append(my_obj)
+        enemy_obj_dmg.append(enemy_obj_val)
+        obj_games += 1
+
+    # ── Objectives ───────────────────────────────────────────────────────────
+    teams = data["info"]["teams"]
+    for t in teams:
+        if t["teamId"] == my_team_id:
+            my_dragons.append(t["objectives"]["dragon"]["kills"])
+            my_barons.append(t["objectives"]["baron"]["kills"])
+        else:
+            enemy_dragons.append(t["objectives"]["dragon"]["kills"])
+            enemy_barons.append(t["objectives"]["baron"]["kills"])
+
+    # ── Gold ─────────────────────────────────────────────────────────────────
+    my_team_gold.append(my_team_total_gold)
+    enemy_team_gold.append(enemy_team_total_gold)
+    if my_top_gold_this_game is not None and enemy_top_gold_this_game is not None:
+        my_top_gold.append(my_top_gold_this_game)
+        enemy_top_gold.append(enemy_top_gold_this_game)
+
+    # ── Timeline: gold @15 + phase K/D/A/KP% ────────────────────────────────
+    timeline_url = f"https://sea.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline?api_key={API_KEY}"
+    timeline = safe_get(timeline_url)
+
+    if timeline is None or "info" not in timeline:
+        print(f"  Bad timeline response: {timeline}")
+        continue
+
+    # Gold @15
+    frame_15 = None
+    for frame in timeline["info"]["frames"]:
+        if frame["timestamp"] >= EARLY_END_MS:
+            frame_15 = frame
+            break
+
+    gold_diff_this_game = None
+    if frame_15 and enemy_top_pid is not None:
+        my_g15    = frame_15["participantFrames"][str(my_pid)]["totalGold"]
+        enemy_g15 = frame_15["participantFrames"][str(enemy_top_pid)]["totalGold"]
+        gold_diff_this_game = my_g15 - enemy_g15
+        gold_diff_15.append(gold_diff_this_game)
+    
+    if "info" not in timeline:
+        print(f"  Bad timeline response: {timeline}")
+    # Phase K/D/A from kill events
+    # We need: for each kill event — who got the kill, who died, who assisted
+    # Bucket by timestamp into early/mid/late
+
+    game_duration_ms = data["info"]["gameDuration"] * 1000
+
+    # Per-game phase counters
+    g_my_ek = 0; g_my_ed = 0; g_my_ea = 0
+    g_my_mk = 0; g_my_md = 0; g_my_ma = 0
+    g_my_lk = 0; g_my_ld = 0; g_my_la = 0
+
+    g_et_ek = 0; g_et_ed = 0; g_et_ea = 0
+    g_et_mk = 0; g_et_md = 0; g_et_ma = 0
+    g_et_lk = 0; g_et_ld = 0; g_et_la = 0
+
+    g_team_ek = 0; g_team_mk = 0; g_team_lk = 0
+    g_enemy_ek = 0; g_enemy_mk = 0; g_enemy_lk = 0
+
+    for frame in timeline["info"]["frames"]:
+        for event in frame.get("events", []):
+            if event["type"] != "CHAMPION_KILL":
+                continue
+            ts = event["timestamp"]
+            killer_pid = event.get("killerId", 0)
+            victim_pid = event.get("victimId", 0)
+            assist_pids = event.get("assistingParticipantIds", [])
+
+            # Map pid → puuid
+            killer_puuid = None
+            victim_puuid = None
+            for p in participants:
+                if p["participantId"] == killer_pid:
+                    killer_puuid = p["puuid"]
+                if p["participantId"] == victim_pid:
+                    victim_puuid = p["puuid"]
+
+            # Determine phase
+            if ts < EARLY_END_MS:
+                phase = "early"
+            elif ts < MID_END_MS:
+                phase = "mid"
+            else:
+                phase = "late"
+
+            # Team kill (for KP%)
+            killer_team = None
+            for p in participants:
+                if p["participantId"] == killer_pid:
+                    killer_team = p["teamId"]
+                    break
+            if killer_team == my_team_id:
+                if phase == "early": g_team_ek += 1
+                elif phase == "mid": g_team_mk += 1
+                else:                g_team_lk += 1
+            elif killer_team == enemy_team_id:
+                if phase == "early": g_enemy_ek += 1
+                elif phase == "mid": g_enemy_mk += 1
+                else:                g_enemy_lk += 1
+
+            # ── You ──
+            # Kill
+            if killer_puuid == PUUID:
+                if phase == "early": g_my_ek += 1
+                elif phase == "mid": g_my_mk += 1
+                else:                g_my_lk += 1
+            # Death
+            if victim_puuid == PUUID:
+                if phase == "early": g_my_ed += 1
+                elif phase == "mid": g_my_md += 1
+                else:                g_my_ld += 1
+            # Assist
+            if my_pid in assist_pids:
+                if phase == "early": g_my_ea += 1
+                elif phase == "mid": g_my_ma += 1
+                else:                g_my_la += 1
+
+            # ── Enemy top ──
+            if enemy_top_pid is None:
+                continue
+            # Kill
+            if killer_pid == enemy_top_pid:
+                if phase == "early": g_et_ek += 1
+                elif phase == "mid": g_et_mk += 1
+                else:                g_et_lk += 1
+            # Death
+            if victim_pid == enemy_top_pid:
+                if phase == "early": g_et_ed += 1
+                elif phase == "mid": g_et_md += 1
+                else:                g_et_ld += 1
+            # Assist
+            if enemy_top_pid in assist_pids:
+                if phase == "early": g_et_ea += 1
+                elif phase == "mid": g_et_ma += 1
+                else:                g_et_la += 1
+
+    # Accumulate into global phase counters
+    my_early_k += g_my_ek; my_early_d += g_my_ed; my_early_a += g_my_ea
+    my_mid_k   += g_my_mk; my_mid_d   += g_my_md; my_mid_a   += g_my_ma
+    my_late_k  += g_my_lk; my_late_d  += g_my_ld; my_late_a  += g_my_la
+
+    et_early_k += g_et_ek; et_early_d += g_et_ed; et_early_a += g_et_ea
+    et_mid_k   += g_et_mk; et_mid_d   += g_et_md; et_mid_a   += g_et_ma
+    et_late_k  += g_et_lk; et_late_d  += g_et_ld; et_late_a  += g_et_la
+
+    team_early_k += g_team_ek
+    team_mid_k   += g_team_mk
+    team_late_k  += g_team_lk
+    enemy_team_early_k += g_enemy_ek
+    enemy_team_mid_k   += g_enemy_mk
+    enemy_team_late_k  += g_enemy_lk
+    # ── Team K/D split — TRUE team K/D from total kills / total deaths ──────────
+    my  = team_stats[my_team_id]
+    opp = team_stats[enemy_team_id]
+
+    # Per-game true team K/D
+    my_kd    = kd(my["k"], my["d"])
+    enemy_kd = kd(opp["k"], opp["d"])
+
+    # Accumulate all-game totals
+    my_team_total_k_all += my["k"]
+    my_team_total_d_all += my["d"]
+    enemy_team_total_k_all += opp["k"]
+    enemy_team_total_d_all += opp["d"]
+
+    if my_kd > enemy_kd:
+        my_team_kd_higher_games += 1
+        my_team_better_games += 1
+
+        my_team_k_my_team_better += my["k"]
+        my_team_d_my_team_better += my["d"]
+        enemy_team_k_my_team_better += opp["k"]
+        enemy_team_d_my_team_better += opp["d"]
+
+        my_team_gold_my_team_better.append(my_team_total_gold)
+        enemy_team_gold_my_team_better.append(enemy_team_total_gold)
+
+        if my_personal_k is not None:
+            my_k_when_winning += my_personal_k
+            my_d_when_winning += my_personal_d
+            my_a_when_winning += my_personal_a
+
+        if enemy_top_k is not None:
+            enemy_top_k_my_team_better += enemy_top_k
+            enemy_top_d_my_team_better += enemy_top_d
+            enemy_top_a_my_team_better += enemy_top_a
+
+        if gold_diff_this_game is not None:
+            gold_diff_15_my_team_better.append(gold_diff_this_game)
+
+        if my_top_gold_this_game is not None:
+            my_top_gold_my_team_better.append(my_top_gold_this_game)
+            enemy_top_gold_my_team_better.append(enemy_top_gold_this_game)
+
+    elif enemy_kd > my_kd:
+        enemy_team_kd_higher_games += 1
+        enemy_better_games += 1
+
+        my_team_k_enemy_better += my["k"]
+        my_team_d_enemy_better += my["d"]
+        enemy_team_k_enemy_better += opp["k"]
+        enemy_team_d_enemy_better += opp["d"]
+
+        my_team_gold_enemy_better.append(my_team_total_gold)
+        enemy_team_gold_enemy_better.append(enemy_team_total_gold)
+
+        if my_personal_k is not None:
+            my_k_enemy_better += my_personal_k
+            my_d_enemy_better += my_personal_d
+            my_a_enemy_better += my_personal_a
+
+        if enemy_top_k is not None:
+            enemy_top_k_enemy_better += enemy_top_k
+            enemy_top_d_enemy_better += enemy_top_d
+            enemy_top_a_enemy_better += enemy_top_a
+
+        if gold_diff_this_game is not None:
+            gold_diff_15_enemy_better.append(gold_diff_this_game)
+
+        if my_top_gold_this_game is not None:
+            my_top_gold_enemy_better.append(my_top_gold_this_game)
+            enemy_top_gold_enemy_better.append(enemy_top_gold_this_game)
+
+    else:
+        tied_team_kd_games += 1
+
+
+    print(f"\n  My team:    {my['k']}/{my['d']}  (K/D: {my_kd:.2f})")
+    print(f"  Enemy team: {opp['k']}/{opp['d']}  (K/D: {enemy_kd:.2f})")
+
+# ── Output ───────────────────────────────────────────────────────────────────
+sep = "=" * 100
+
+print(f"\n{sep}")
+print(f"\nProcessed {games_played} ranked TOP games")
+print(f"\n  RESULT SUMMARY:")
+print(f"    Wins:    {wins}")
+print(f"    Losses:  {losses}")
+print(f"    Winrate: {wins / games_played * 100:.1f}%")
+
+print(f"\n  OVERALL K/D/A (TOP LANE vs ENEMY TOP):")
+print(f"    You:        {my_top_total_k}/{my_top_total_d}/{my_top_total_a}  "
+      f"K/D: {kd(my_top_total_k, my_top_total_d):.2f}  "
+      f"KDA: {kda(my_top_total_k, my_top_total_d, my_top_total_a):.2f}")
+print(f"    Enemy top:  {enemy_top_total_k}/{enemy_top_total_d}/{enemy_top_total_a}  "
+      f"K/D: {kd(enemy_top_total_k, enemy_top_total_d):.2f}  "
+      f"KDA: {kda(enemy_top_total_k, enemy_top_total_d, enemy_top_total_a):.2f}")
+
+print(f"\n  TRUE TEAM K/D across {games_played} games:")
+overall_my_team_kd = kd(my_team_total_k_all, my_team_total_d_all)
+overall_enemy_team_kd = kd(enemy_team_total_k_all, enemy_team_total_d_all)
+
+print(f"    My team:    {my_team_total_k_all}/{my_team_total_d_all}  K/D: {overall_my_team_kd:.2f}")
+print(f"    Enemy team: {enemy_team_total_k_all}/{enemy_team_total_d_all}  K/D: {overall_enemy_team_kd:.2f}")
+print(f"    Difference: {overall_my_team_kd - overall_enemy_team_kd:+.2f}  "
+      f"({'ahead' if overall_my_team_kd > overall_enemy_team_kd else 'behind'})")
+
+
+print(f"\n  TEAM K/D RESULT COUNT:")
+print(f"    My team higher K/D:    {my_team_kd_higher_games}/{games_played}  ({my_team_kd_higher_games/games_played*100:.1f}%)")
+print(f"    Enemy team higher K/D: {enemy_team_kd_higher_games}/{games_played}  ({enemy_team_kd_higher_games/games_played*100:.1f}%)")
+print(f"    Tied:                  {tied_team_kd_games}/{games_played}")
+
+print(f"\n  TEAM K/D (EXCLUDING TOP LANERS):")
+print(f"    My team (4-man):    {my_team_no_top_k}/{my_team_no_top_d}  K/D: {kd(my_team_no_top_k, my_team_no_top_d):.2f}")
+print(f"    Enemy team (4-man): {enemy_team_no_top_k}/{enemy_team_no_top_d}  K/D: {kd(enemy_team_no_top_k, enemy_team_no_top_d):.2f}")
+print(f"    Difference:         {kd(my_team_no_top_k, my_team_no_top_d) - kd(enemy_team_no_top_k, enemy_team_no_top_d):+.2f}")
+
+print(f"\n  DEATH ANALYSIS:")
+print(f"    Your avg deaths:            {avg(my_deaths_list):.2f}")
+print(f"    My team avg deaths:         {avg(teammate_deaths_list):.2f}")
+print(f"    Enemy team avg deaths:      {avg(enemy_deaths_list):.2f}")
+print(f"    My team vs enemy diff:      {avg(teammate_deaths_list) - avg(enemy_deaths_list):+.2f}")
+print(f"    Enemy top avg deaths:       {avg(enemy_top_deaths_list):.2f}")
+print(f"    You vs enemy top diff:      {avg(my_deaths_list) - avg(enemy_top_deaths_list):+.2f}")
+
+print(f"\n  DAMAGE (avg per game):")
+print(f"    You:                        {avg(my_dmg_list):,.0f}  ({avg(my_dmg_share_list):.1f}% of team)")
+print(f"    Enemy top:                  {avg(enemy_top_dmg_list):,.0f}  ({avg(enemy_top_dmg_share_list):.1f}% of their team)")
+print(f"    Raw diff:                   {avg(my_dmg_list) - avg(enemy_top_dmg_list):+,.0f}")
+print(f"    Share diff:                 {avg(my_dmg_share_list) - avg(enemy_top_dmg_share_list):+.1f}%")
+
+print(f"\n  DAMAGE MITIGATED (avg per game):")
+print(f"    You:                        {avg(my_mit_list):,.0f}  ({avg(my_mit_share_list):.1f}% of team)")
+print(f"    Enemy top:                  {avg(enemy_top_mit_list):,.0f}  ({avg(enemy_top_mit_share_list):.1f}% of their team)")
+print(f"    Raw diff:                   {avg(my_mit_list) - avg(enemy_top_mit_list):+,.0f}")
+print(f"    Share diff:                 {avg(my_mit_share_list) - avg(enemy_top_mit_share_list):+.1f}%")
+
+print(f"\n  PHASE BREAKDOWN  (Early 0-15 / Mid 15-30 / Late 30+)")
+print(f"  {'':30} {'EARLY':>20}  {'MID':>20}  {'LATE':>20}")
+print(f"  {'':30} {'K/D/A  KDA  KP%':>20}  {'K/D/A  KDA  KP%':>20}  {'K/D/A  KDA  KP%':>20}")
+print(f"  {'-'*93}")
+
+# Compute KP% per phase
+my_e_kp  = kp(my_early_k, my_early_a, team_early_k)
+my_m_kp  = kp(my_mid_k,   my_mid_a,   team_mid_k)
+my_l_kp  = kp(my_late_k,  my_late_a,  team_late_k)
+
+def fmt_phase(k, d, a, kp_pct):
+    kda_val = kda(k, d, a)
+    kd_val  = kd(k, d)
+    return f"{k}/{d}/{a}  {kda_val:.2f}  {kp_pct:.0f}%"
+
+print(f"  {'You':<30} {fmt_phase(my_early_k, my_early_d, my_early_a, my_e_kp):>20}  "
+      f"{fmt_phase(my_mid_k, my_mid_d, my_mid_a, my_m_kp):>20}  "
+      f"{fmt_phase(my_late_k, my_late_d, my_late_a, my_l_kp):>20}")
+
+et_e_kp = kp(et_early_k, et_early_a, enemy_team_early_k)
+et_m_kp = kp(et_mid_k,   et_mid_a,   enemy_team_mid_k)
+et_l_kp = kp(et_late_k,  et_late_a,  enemy_team_late_k)
+
+# Enemy top KP% — we don't track enemy team kills separately, use enemy top participation vs enemy team
+# Approximate: enemy_team_k can be inferred from team_stats accumulation isn't stored per game.
+# Use their raw K+A vs total kills in game as an approximation (honest note printed)
+print(f"  {'Enemy top (KP% approx)':<30} "
+      f"{fmt_phase(et_early_k, et_early_d, et_early_a, et_e_kp):>20}  "
+      f"{fmt_phase(et_mid_k, et_mid_d, et_mid_a, et_m_kp):>20}  "
+      f"{fmt_phase(et_late_k, et_late_d, et_late_a, et_l_kp):>20}")
+print(f"  (Note: enemy top KP% requires tracking their team kills per phase — add if needed)")
+
+print(f"\n  PHASE DIFF (You minus Enemy top):")
+print(f"    Early  K: {my_early_k - et_early_k:+d}  D: {my_early_d - et_early_d:+d}  A: {my_early_a - et_early_a:+d}  "
+      f"KDA: {kda(my_early_k,my_early_d,my_early_a) - kda(et_early_k,et_early_d,et_early_a):+.2f}")
+print(f"    Mid    K: {my_mid_k - et_mid_k:+d}  D: {my_mid_d - et_mid_d:+d}  A: {my_mid_a - et_mid_a:+d}  "
+      f"KDA: {kda(my_mid_k,my_mid_d,my_mid_a) - kda(et_mid_k,et_mid_d,et_mid_a):+.2f}")
+print(f"    Late   K: {my_late_k - et_late_k:+d}  D: {my_late_d - et_late_d:+d}  A: {my_late_a - et_late_a:+d}  "
+      f"KDA: {kda(my_late_k,my_late_d,my_late_a) - kda(et_late_k,et_late_d,et_late_a):+.2f}")
+
+print(f"\n  WHEN ENEMY TEAM HAS HIGHER K/D ({enemy_better_games} games):")
+avg_mt_bad = kd(my_team_k_enemy_better, my_team_d_enemy_better)
+avg_et_bad = kd(enemy_team_k_enemy_better, enemy_team_d_enemy_better)
+my_kd_eb   = kd(my_k_enemy_better, my_d_enemy_better)
+my_kda_eb  = kda(my_k_enemy_better, my_d_enemy_better, my_a_enemy_better)
+et_kd_eb   = kd(enemy_top_k_enemy_better, enemy_top_d_enemy_better)
+et_kda_eb  = kda(enemy_top_k_enemy_better, enemy_top_d_enemy_better, enemy_top_a_enemy_better)
+print(f"    My team avg K/D:    {avg_mt_bad:.2f}")
+print(f"    Enemy team avg K/D: {avg_et_bad:.2f}")
+print(f"    Your K/D:           {my_kd_eb:.2f}  KDA: {my_kda_eb:.2f}  ({my_k_enemy_better}/{my_d_enemy_better}/{my_a_enemy_better})")
+print(f"    Enemy top K/D:      {et_kd_eb:.2f}  KDA: {et_kda_eb:.2f}  ({enemy_top_k_enemy_better}/{enemy_top_d_enemy_better}/{enemy_top_a_enemy_better})")
+print(f"    You vs enemy top K/D: {my_kd_eb - et_kd_eb:+.2f}   KDA: {my_kda_eb - et_kda_eb:+.2f}")
+
+print(f"\n  WHEN MY TEAM HAS HIGHER K/D ({my_team_better_games} games):")
+avg_mt_good = kd(my_team_k_my_team_better, my_team_d_my_team_better)
+avg_et_good = kd(enemy_team_k_my_team_better, enemy_team_d_my_team_better)
+my_kd_ww    = kd(my_k_when_winning, my_d_when_winning)
+my_kda_ww   = kda(my_k_when_winning, my_d_when_winning, my_a_when_winning)
+et_kd_ww    = kd(enemy_top_k_my_team_better, enemy_top_d_my_team_better)
+et_kda_ww   = kda(enemy_top_k_my_team_better, enemy_top_d_my_team_better, enemy_top_a_my_team_better)
+print(f"    My team avg K/D:    {avg_mt_good:.2f}")
+print(f"    Enemy team avg K/D: {avg_et_good:.2f}")
+print(f"    Your K/D:           {my_kd_ww:.2f}  KDA: {my_kda_ww:.2f}  ({my_k_when_winning}/{my_d_when_winning}/{my_a_when_winning})")
+print(f"    Enemy top K/D:      {et_kd_ww:.2f}  KDA: {et_kda_ww:.2f}  ({enemy_top_k_my_team_better}/{enemy_top_d_my_team_better}/{enemy_top_a_my_team_better})")
+print(f"    You vs enemy top K/D: {my_kd_ww - et_kd_ww:+.2f}   KDA: {my_kda_ww - et_kda_ww:+.2f}")
+
+if top_games > 0:
+    print(f"\n  TOP LANE TURRET DAMAGE ({top_games} games):")
+    print(f"    Your avg:   {avg(my_top_turret_dmg):,.0f}")
+    print(f"    Enemy avg:  {avg(enemy_top_turret_dmg):,.0f}")
+    print(f"    Diff:       {avg(my_top_turret_dmg) - avg(enemy_top_turret_dmg):+,.0f}")
+
+if obj_games > 0:
+    print(f"\n  OBJECTIVE ANALYSIS ({obj_games} games):")
+    print(f"    Your obj dmg:   {avg(my_obj_dmg):,.0f}")
+    print(f"    Enemy obj dmg:  {avg(enemy_obj_dmg):,.0f}")
+    print(f"    Diff:           {avg(my_obj_dmg) - avg(enemy_obj_dmg):+,.0f}")
+    print(f"\n    Dragons — You: {avg(my_dragons):.2f}  Enemy: {avg(enemy_dragons):.2f}")
+    print(f"    Barons  — You: {avg(my_barons):.2f}  Enemy: {avg(enemy_barons):.2f}")
+
+if gold_diff_15:
+    print(f"\n  GOLD @15 (TOP vs TOP):")
+    print(f"    Avg diff:     {avg(gold_diff_15):+,.0f}")
+    if gold_diff_15_enemy_better:
+        print(f"    When losing:  {avg(gold_diff_15_enemy_better):+,.0f}")
+    if gold_diff_15_my_team_better:
+        print(f"    When winning: {avg(gold_diff_15_my_team_better):+,.0f}")
+
+print(f"\n  GOLD WHEN TEAM HAS LOWER K/D:")
+if my_top_gold_enemy_better:
+    print(f"    Top lane — You: {avg(my_top_gold_enemy_better):,.0f}  Enemy: {avg(enemy_top_gold_enemy_better):,.0f}  "
+          f"Diff: {avg(my_top_gold_enemy_better)-avg(enemy_top_gold_enemy_better):+,.0f}")
+if my_team_gold_enemy_better:
+    print(f"    Team     — You: {avg(my_team_gold_enemy_better):,.0f}  Enemy: {avg(enemy_team_gold_enemy_better):,.0f}  "
+          f"Diff: {avg(my_team_gold_enemy_better)-avg(enemy_team_gold_enemy_better):+,.0f}")
+
+print(f"\n  GOLD WHEN TEAM HAS HIGHER K/D:")
+if my_top_gold_my_team_better:
+    print(f"    Top lane — You: {avg(my_top_gold_my_team_better):,.0f}  Enemy: {avg(enemy_top_gold_my_team_better):,.0f}  "
+          f"Diff: {avg(my_top_gold_my_team_better)-avg(enemy_top_gold_my_team_better):+,.0f}")
+if my_team_gold_my_team_better:
+    print(f"    Team     — You: {avg(my_team_gold_my_team_better):,.0f}  Enemy: {avg(enemy_team_gold_my_team_better):,.0f}  "
+          f"Diff: {avg(my_team_gold_my_team_better)-avg(enemy_team_gold_my_team_better):+,.0f}")
+
+
+
+print(f"\n  AVERAGE RANKS:")
+print(f"    You:                  {num_to_rank(avg(my_rank_nums))}")
+print(f"    Enemy top:            {num_to_rank(avg(enemy_top_rank_nums))}")
+print(f"    My team (excl. top):  {num_to_rank(avg(my_team_rank_nums))}")
+print(f"    Enemy team (excl. top): {num_to_rank(avg(enemy_team_rank_nums))}")
+
+print(f"\n{sep}\n")
